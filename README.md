@@ -4,7 +4,7 @@ A small cloud-native observability platform. It collects CPU, memory, disk and n
 **Isolation Forest** (scikit-learn) to detect anomalies, estimates a **failure risk (0-100%)**, shows everything on a
 live **React + Chart.js** dashboard, and e-mails administrators through **Amazon SNS** when a critical anomaly appears.
 
-![Architecture](docs/architecture.svg)
+![Architecture](architecture.svg)
 
 **Honest status:** the application, ML model and tests run and pass locally with simulated data. The CloudFormation
 template passes `cfn-lint`, but **it has not been deployed to a real AWS account by the author of this code**. The SNS,
