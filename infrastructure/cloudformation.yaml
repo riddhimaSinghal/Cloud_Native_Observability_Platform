@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AI-Powered Cloud Infrastructure Monitoring and Predictive Failure Detection.
+  One EC2 instance (FastAPI + scikit-learn + React dashboard), SNS email alerts,
+  DynamoDB history tables, and CloudWatch alarms. Low cost: t3.micro, on-demand DynamoDB.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cad-monitor
+    AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
+    Description: Lower-case prefix used to name resources.
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Email address that receives alerts (you must confirm the SNS subscription email).
+  ApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Secret that protects the simulate/retrain endpoints (type it into the dashboard Demo controls).
+  AllowedCidr:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: IP range allowed to open the dashboard, e.g. 203.0.113.25/32 (your public IP). Avoid 0.0.0.0/0.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into (the default VPC is fine).
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A PUBLIC subnet in that VPC (default VPC subnets are public).
+  CodeBucket:
+    Type: String
+    Description: S3 bucket (same region) that holds the uploaded project zip.
+  CodeKey:
+    Type: String
+    Default: cad-monitor.zip
+    Description: Object key of the project zip inside the bucket.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------- Notifications ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      DisplayName: AI Cloud Monitor Alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------- Storage ----------
+  MetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-metrics"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: server_id, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: server_id, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }   # rows auto-delete after 24h
+      SSESpecification: { SSEEnabled: true }
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-alerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: server_id, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: server_id, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      SSESpecification: { SSEEnabled: true }
+
+  # ---------- Security: least-privilege role for the instance ----------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # shell access without opening SSH
+      Policies:
+        - PolicyName: cad-monitor-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: [!GetAtt MetricsTable.Arn, !GetAtt AlertsTable.Arn]
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: { StringEquals: { "cloudwatch:namespace": CADMonitor } }
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucket}/${CodeKey}"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Dashboard access (HTTP 80) from the allowed CIDR only. No SSH.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr, Description: Dashboard }
+
+  # ---------- Compute ----------
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }   # IMDSv2 only
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref SubnetId
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 12, VolumeType: gp3, Encrypted: true }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-server" }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y python3-pip unzip
+          mkdir -p /opt/cad-monitor
+          aws s3 cp "s3://${CodeBucket}/${CodeKey}" /tmp/app.zip --region ${AWS::Region}
+          unzip -o /tmp/app.zip -d /opt/cad-monitor
+          python3 -m venv /opt/cad-monitor/venv
+          /opt/cad-monitor/venv/bin/pip install --no-cache-dir -r /opt/cad-monitor/backend/requirements.txt
+          useradd --system --no-create-home cadmon || true
+          chown -R cadmon:cadmon /opt/cad-monitor
+          cat > /etc/cad-monitor.env <<ENV
+          METRICS_SOURCE=real
+          TICK_INTERVAL=5
+          API_KEY=${ApiKey}
+          AWS_REGION=${AWS::Region}
+          SNS_TOPIC_ARN=${AlertTopic}
+          DYNAMODB_METRICS_TABLE=${MetricsTable}
+          DYNAMODB_ALERTS_TABLE=${AlertsTable}
+          CLOUDWATCH_ENABLED=true
+          CLOUDWATCH_PROJECT=${ProjectName}
+          ALLOWED_ORIGINS=http://localhost
+          ENV
+          chmod 600 /etc/cad-monitor.env
+          cat > /etc/systemd/system/cad-monitor.service <<UNIT
+          [Unit]
+          Description=AI Cloud Monitor
+          After=network-online.target
+          [Service]
+          User=cadmon
+          WorkingDirectory=/opt/cad-monitor/backend
+          EnvironmentFile=/etc/cad-monitor.env
+          ExecStart=/opt/cad-monitor/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 80
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          NoNewPrivileges=true
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now cad-monitor
+
+  # ---------- CloudWatch alarms -> SNS ----------
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ec2-high-cpu"
+      AlarmDescription: EC2 CPU at or above 80% for 10 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: InstanceId, Value: !Ref Server }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ec2-status-check"
+      AlarmDescription: EC2 instance or system status check failed
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{ Name: InstanceId, Value: !Ref Server }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  FailureRiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ml-failure-risk"
+      AlarmDescription: ML failure-risk score published by the app is 75 or higher
+      Namespace: CADMonitor
+      MetricName: FailureRisk
+      Dimensions: [{ Name: Project, Value: !Ref ProjectName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 75
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  DashboardUrl:
+    Description: Open in a browser ~4 minutes after creation; the model needs ~5 more minutes to learn the baseline.
+    Value: !Sub "http://${Server.PublicIp}/"
+  InstanceId:
+    Value: !Ref Server
+  AlertTopicArn:
+    Value: !Ref AlertTopic
